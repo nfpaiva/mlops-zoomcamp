@@ -1,0 +1,2 @@
+[MASTER]
+ignore=get_datasets.py,duration-prediction.py
