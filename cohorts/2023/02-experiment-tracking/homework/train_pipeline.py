@@ -16,6 +16,8 @@ import yaml
 import optuna
 import mlflow  # type: ignore
 from mlflow.tracking import MlflowClient  # type: ignore
+from mlflow.entities import Run, model_registry  # type: ignore
+from mlflow.entities.experiment import Experiment  # type: ignore
 from optuna.samplers import TPESampler
 from sklearn.ensemble import RandomForestRegressor  # type: ignore
 from sklearn.feature_extraction import DictVectorizer  # type: ignore
@@ -25,6 +27,18 @@ from sklearn.pipeline import Pipeline  # type: ignore
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class NoExperimentFound(Exception):
+    """Exception raised when no experiment is found."""
+
+
+class NoRunsFound(Exception):
+    """Exception raised when no runs are found."""
+
+
+class NoModelsFound(Exception):
+    """Exception raised when no models are found."""
 
 
 @dataclass
@@ -61,9 +75,9 @@ class DatasetSplit:
     x_train: pd.DataFrame
     x_val: pd.DataFrame
     x_test: pd.DataFrame
-    y_train: np.ndarray
-    y_val: np.ndarray
-    y_test: np.ndarray
+    y_train: Union[np.ndarray, pd.Series]
+    y_val: Union[np.ndarray, pd.Series]
+    y_test: Union[np.ndarray, pd.Series]
 
 
 class DataHandler:
@@ -304,7 +318,7 @@ class MLflowHelper:
             # Remove the directory and its contents
             shutil.rmtree(directory_path)
 
-    def setup_mlflow(self) -> mlflow.entities.Experiment:
+    def setup_mlflow(self) -> Experiment:
         """Set up MLflow tracking with a new database and create a new experiment.
 
         Returns:
@@ -315,7 +329,7 @@ class MLflowHelper:
         self.experiment = mlflow.set_experiment(self.hpo_experiment_name)
         return self.experiment
 
-    def get_best_model_from_last_run(self) -> mlflow.entities.Run:
+    def get_best_model_from_last_run(self) -> Run:
         """Get the best model from the last run in the MLflow experiment.
 
         Returns:
@@ -325,13 +339,19 @@ class MLflowHelper:
         existing_runs = self.client.search_runs(
             experiment_ids=[self.experiment.experiment_id]
         )
+        if not existing_runs:
+            raise NoRunsFound(
+                f"No runs found in experiment {self.experiment.experiment_id}"
+            )
+
         existing_hpo_run_ids = [
             int(run.data.tags.get("hpo_run_id", 0)) for run in existing_runs
         ]
         max_hpo_run_id = max(existing_hpo_run_ids) if existing_hpo_run_ids else 0
 
         # Retrieve the best model run based on the maximum hpo_run_id and test set RMSE
-        best_run = None
+        # The first run in the list is the best run by default
+        best_run = existing_runs[0]
         best_rmse = float("inf")
         for run in existing_runs:
             hpo_run_id = int(run.data.tags.get("hpo_run_id", 0))
@@ -345,7 +365,7 @@ class MLflowHelper:
 
     def get_production_version(
         self, registered_model_name: str
-    ) -> Union[mlflow.entities.model_registry.ModelVersion, None]:
+    ) -> Union[model_registry.ModelVersion, None]:
         """Get the current production model version.
 
         Args:
@@ -406,7 +426,10 @@ class MLflowHelper:
         return max_model_id + 1
 
     def run_register_model(
-        self, hpo_champion_model: str, x_test_reg: pd.DataFrame, y_test_reg: np.ndarray
+        self,
+        hpo_champion_model: str,
+        x_test_reg: pd.DataFrame,
+        y_test_reg: Union[np.ndarray, pd.Series],
     ) -> None:
         """Register the best model from the last run and promote it to production if better
         than the current production model.
@@ -434,6 +457,11 @@ class MLflowHelper:
                 production_version_details.source
             )
 
+            if not production_pipeline:
+                raise NoModelsFound(
+                    f"No production model found for {hpo_champion_model}"
+                )
+
             # Calculate RMSE for the production model
             y_pred_production = production_pipeline.predict(
                 x_test_reg.to_dict(orient="records")
@@ -446,6 +474,10 @@ class MLflowHelper:
 
             # Calculate RMSE for the best model from the last run
             best_pipeline = mlflow.sklearn.load_model(best_model_uri)
+            if not best_pipeline:
+                raise NoModelsFound(
+                    f"No best model found for {hpo_champion_model} in run {best_run.info.run_id}"
+                )
             y_pred_best = best_pipeline.predict(x_test_reg.to_dict(orient="records"))
             rmse_best = mean_squared_error(y_test_reg, y_pred_best, squared=False)
 
@@ -462,10 +494,7 @@ class MLflowHelper:
                 )
                 mlflow.register_model(model_uri=best_model_uri, name=hpo_champion_model)
                 version = (
-                    self.client.get_latest_versions(hpo_champion_model, stages=None)[
-                        0
-                    ].version
-                    + 1
+                    self.client.get_latest_versions(hpo_champion_model)[0].version + 1
                 )
                 self.client.transition_model_version_stage(
                     hpo_champion_model, version=str(version), stage="Production"
@@ -483,16 +512,21 @@ class MLflowHelper:
         else:
             # If no production version found, register the best model from the last run
             mlflow.register_model(model_uri=best_model_uri, name=hpo_champion_model)
-            version = (
-                self.client.get_latest_versions(hpo_champion_model, stages=None)[
-                    0
-                ].version
-                + 1
-            )
+            version = self.client.get_latest_versions(hpo_champion_model)[0].version + 1
             self.client.transition_model_version_stage(
                 hpo_champion_model, version=str(version), stage="Production"
             )
             logger.info("The best model from the last run put into production.")
+
+    def _get_experiment_or_raise(self) -> Experiment:
+        """Get the experiment or raise an exception if it does not exist."""
+
+        experiment = mlflow.get_experiment_by_name(self.hpo_experiment_name)
+        if experiment is None:
+            raise NoExperimentFound(
+                f"No experiment found with name {self.hpo_experiment_name}."
+            )
+        return experiment
 
 
 def run_optimization(
@@ -543,7 +577,7 @@ def run_optimization(
     # Build HPO Run id
     hpo_run_id = mlflow_helper_obj_opt.get_max_hpo_run_id()
 
-    def objective(trial):
+    def objective(trial) -> float:
         params = {
             "random_forest__n_estimators": trial.suggest_int("n_estimators", 10, 50, 1),
             "random_forest__max_depth": trial.suggest_int("max_depth", 1, 20, 1),
@@ -579,10 +613,12 @@ def run_optimization(
             pipeline_opt.named_steps["random_forest"].fit(x_train_preproc, y_train_opt)
 
             y_pred_val = pipeline_opt.predict(x_val_opt.to_dict(orient="records"))
-            rmse_val = mean_squared_error(y_val_opt, y_pred_val, squared=False)
+            rmse_val: float = mean_squared_error(y_val_opt, y_pred_val, squared=False)
 
             y_pred_test = pipeline_opt.predict(x_test_opt.to_dict(orient="records"))
-            rmse_test = mean_squared_error(y_test_opt, y_pred_test, squared=False)
+            rmse_test: float = mean_squared_error(
+                y_test_opt, y_pred_test, squared=False
+            )
 
             mlflow.log_metric("RMSE_Val", rmse_val)
             logger.info("Trial %s: RMSE_Val = %s", trial.number, rmse_val)
