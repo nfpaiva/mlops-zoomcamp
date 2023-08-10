@@ -16,14 +16,22 @@ repos:
 #   hooks:
 #   - id: mypy
 
-- repo: local
-  hooks:
-  - id: pylint
-    name: pylint
-    entry: pylint
-    language: system
-    types: [python]
-    require_serial: true
-    args:
-    - --output-format=colorized
-    - --reports=no
+# - repo: local
+#   hooks:
+#   - id: pylint
+#     name: pylint
+#     entry: pylint
+#     language: system
+#     types: [python]
+#     require_serial: true
+#     args:
+#     - --output-format=colorized
+#     - --reports=no
+
+# -   repo: local
+#     hooks:
+#     -   id: re-run-training
+#         name: Re-run the training script
+#         entry: ./cohorts/2023/02-experiment-tracking/homework/re_run_training.sh
+#         language: script
+#         pass_filenames: false

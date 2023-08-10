@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Union, Tuple
 from dataclasses import dataclass
 
 import pandas as pd
@@ -196,7 +196,7 @@ class DataHandler:
         """
         df_data = {}
         for dataset, inner_month_info in file_names_load.items():
-            file_path = self.download_data(inner_month_info["file_name"])
+            file_path = inner_month_info["link"]
             df_data[dataset] = pd.read_parquet(file_path)
 
         return df_data
@@ -258,7 +258,7 @@ class MLflowHelper:
         db_path (str): Path to the MLflow database.
         hpo_experiment_name (str): Name of the hyperparameter optimization
             experiment.
-        client (MlflowClient): MLflow tracking client.
+        client (MlflowClient): MLflow tracking self.client_mlflow.
         experiment (mlflow.entities.Experiment): MLflow experiment.
         flag_reset_mlflow (str): Flag to determine whether to reset MLflow
             on initialization.
@@ -293,8 +293,6 @@ class MLflowHelper:
     ):
         self.db_path = mlflow_db_path
         self.hpo_experiment_name = hpo_experiment_name
-        self.client = MlflowClient()
-        self.experiment = mlflow.get_experiment_by_name(self.hpo_experiment_name)
         self.flag_reset_mlflow = (
             args_init.flag_reset_mlflow
         )  # Get flag_reset_mlflow val from args
@@ -318,7 +316,7 @@ class MLflowHelper:
             # Remove the directory and its contents
             shutil.rmtree(directory_path)
 
-    def setup_mlflow(self) -> Experiment:
+    def setup_mlflow(self) -> Tuple[Experiment, mlflow.tracking.MlflowClient]:
         """Set up MLflow tracking with a new database and create a new experiment.
 
         Returns:
@@ -327,7 +325,8 @@ class MLflowHelper:
         database_uri = f"sqlite:///{self.db_path}"
         mlflow.set_tracking_uri(database_uri)
         self.experiment = mlflow.set_experiment(self.hpo_experiment_name)
-        return self.experiment
+        self.client_mlflow = MlflowClient(tracking_uri=database_uri)
+        return self.experiment, self.client_mlflow
 
     def get_best_model_from_last_run(self) -> Run:
         """Get the best model from the last run in the MLflow experiment.
@@ -336,7 +335,8 @@ class MLflowHelper:
             mlflow.entities.Run: The best model run in the MLflow experiment.
         """
         # Get the maximum existing hpo_run_id in the MLflow database
-        existing_runs = self.client.search_runs(
+
+        existing_runs = self.client_mlflow.search_runs(
             experiment_ids=[self.experiment.experiment_id]
         )
         if not existing_runs:
@@ -376,12 +376,12 @@ class MLflowHelper:
             or None if not found.
         """
         try:
-            model_versions = self.client.get_latest_versions(
+            model_versions = self.client_mlflow.get_latest_versions(
                 registered_model_name, stages=["Production"]
             )
             if model_versions:
                 production_version = model_versions[0].version
-                model_version_details = self.client.get_model_version(
+                model_version_details = self.client_mlflow.get_model_version(
                     registered_model_name, production_version
                 )
                 return model_version_details
@@ -396,8 +396,7 @@ class MLflowHelper:
             int: The maximum HPO run ID found in the MLflow database for the specified experiment.
         """
         experiment_id = self.experiment.experiment_id
-
-        existing_runs = self.client.search_runs(experiment_ids=[experiment_id])
+        existing_runs = self.client_mlflow.search_runs(experiment_ids=[experiment_id])
         existing_hpo_run_ids = [
             int(run.data.tags.get("hpo_run_id", 0)) for run in existing_runs
         ]
@@ -414,7 +413,7 @@ class MLflowHelper:
         Returns:
             int: The maximum model_id found within the specified HPO run ID.
         """
-        existing_runs = self.client.search_runs(
+        existing_runs = self.client_mlflow.search_runs(
             experiment_ids=[self.experiment.experiment_id],
             filter_string=f"tags.hpo_run_id = '{hpo_run_id}'",
         )
@@ -487,16 +486,19 @@ class MLflowHelper:
             if rmse_production > rmse_best:
                 # Promote the best model from the last run to production
                 # Archive the existing production model version
-                self.client.transition_model_version_stage(
+                self.client_mlflow.transition_model_version_stage(
                     name=hpo_champion_model,
                     version=production_version_details.version,
                     stage="Archived",
                 )
                 mlflow.register_model(model_uri=best_model_uri, name=hpo_champion_model)
                 version = (
-                    self.client.get_latest_versions(hpo_champion_model)[0].version + 1
+                    self.client_mlflow.get_latest_versions(
+                        hpo_champion_model, stages=None
+                    )[0].version
+                    + 1
                 )
-                self.client.transition_model_version_stage(
+                self.client_mlflow.transition_model_version_stage(
                     hpo_champion_model, version=str(version), stage="Production"
                 )
                 logger.info(
@@ -508,15 +510,30 @@ class MLflowHelper:
                 # do not register or promote it.
                 logger.info(
                     "The new model was not better than the model in production."
+                    "The current model in production remains unchanged."
                 )
+
+            # Add a custom tag to the best model URI to indicate the outcome of the comparison
+            custom_tag = {
+                "comparison_outcome": "better_than_production"
+                if rmse_best < rmse_production
+                else "not_better_than_production",
+                "production_model_uri": str(production_version_details.run_id),
+                "test_rmse": str(rmse_best),
+            }
+
+            for key, value in custom_tag.items():
+                self.client_mlflow.set_tag(best_run.info.run_id, key, value)
+
         else:
-            # If no production version found, register the best model from the last run
-            mlflow.register_model(model_uri=best_model_uri, name=hpo_champion_model)
-            version = self.client.get_latest_versions(hpo_champion_model)[0].version + 1
-            self.client.transition_model_version_stage(
-                hpo_champion_model, version=str(version), stage="Production"
+            logger.info(
+                "No model exists in production. The best model from the "
+                "last run will be put into production."
             )
-            logger.info("The best model from the last run put into production.")
+            mlflow.register_model(model_uri=best_model_uri, name=hpo_champion_model)
+            self.client_mlflow.transition_model_version_stage(
+                name=hpo_champion_model, version="1", stage="Production"
+            )
 
     def _get_experiment_or_raise(self) -> Experiment:
         """Get the experiment or raise an exception if it does not exist."""
@@ -540,7 +557,7 @@ def run_optimization(
 
     Args:
         dataset_split_opt (DatasetSplit): A data class containing the split datasets and labels.
-        client (MlflowClient): MLflow tracking client.
+        client (MlflowClient): MLflow tracking self.client_mlflow.
         experiment (mlflow.entities.Experiment): MLflow experiment.
         num_trials (int): Number of hyperparameter optimization trials.
         pipeline_opt (Pipeline): Sklearn pipeline for the model.
