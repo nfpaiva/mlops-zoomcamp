@@ -1,0 +1,26 @@
+[project]
+name = "assignments"
+version = "0.0.1"
+readme = "README.md"
+requires-python = ">=3.8"
+description = "MLOPS ZoomCamp"
+authors = [
+    {name = "Nuno Paiva<nuno.f.paiva@gmail.pt>"}
+]
+dependencies = ["pandas"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pylint", "pytest-cov", "mypy", "isort", "pandas-stubs", "pre-commit", "fastparquet", "optuna", "mlflow", "types-PyYAML"]
+
+[tool.coverage.run]
+omit = [
+    "*/conftest.py", "*/test*", # omit test files
+]
+
+[tool.coverage.report]
+fail_under = 80
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+src = "src/"
