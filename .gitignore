@@ -18,3 +18,8 @@ __pycache__/
 **.terraform/
 **.terraform.lock*
 **terraform.tfstate*
+scrap.*
+.DS_Store
+
+cohorts/2023/02-experiment-tracking/homework/pre-processed-data/
+mlruns/*
